@@ -15,9 +15,10 @@ import socket
 import re
 import Queue
 
-__version__ = '1.3.1'
+__version__ = '1.4.0'
 
 current_client = None
+current_sub_group = None    # sub_group is synonymous with opc_group.Name
 
 # Win32 only modules not needed for 'open' protocol mode
 if os.name == 'nt':
@@ -145,15 +146,26 @@ class OPCError(Exception):
 class GroupEvents:
    def __init__(self):
       self.client = current_client
+      self.sub_group = current_sub_group
+      self.callback_q = Queue.Queue()
+      self.client.callback_queue[self.sub_group] = self.callback_q
+
+      if self.client.trace: self.client.trace('GroupEvents object created, sub_group=' + self.sub_group)
         
    def OnDataChange(self, TransactionID, NumItems, ClientHandles, ItemValues, Qualities, TimeStamps):
-      self.client.callback_queue.put((TransactionID, ClientHandles, ItemValues, Qualities, TimeStamps))
-   
+      if self.client.trace:
+         self.client.trace('OnDataChange(sub_group=%s) called (TransactionID=%d, NumItems=%d, ClientHandles=%s):' % 
+                           (self.sub_group, TransactionID, NumItems, str(ClientHandles)))
+         self.client.trace('   ItemValues: ' + str(ItemValues))
+
+      self.callback_q.put((TransactionID, ClientHandles, ItemValues, Qualities, TimeStamps))
+
+
 class client():
    def __init__(self, opc_class=None, client_name=None):
       """Instantiate OPC automation class"""
 
-      self.callback_queue = Queue.Queue()
+      self.callback_queue = {}       # dict of Queue.Queue(), keyed by sub_group (aka opc_group.Name)
 
       pythoncom.CoInitialize()
 
@@ -368,7 +380,7 @@ class client():
             error_msg = 'RemoveItems: %s' % self._get_error_str(err)
             raise OPCError, error_msg
 
-      try:         
+      try:
          if include_error:
             sync = True
             
@@ -421,6 +433,10 @@ class client():
                try:
                   if self.trace: self.trace('GetOPCGroup(%s)' % sub_group)
                   opc_group = opc_groups.GetOPCGroup(sub_group)
+
+                  #if self.trace: self.trace('update: %d' % update)
+                  #if self.trace: self.trace('opc_group.UpdateRate: %d' % opc_group.UpdateRate)
+
                   new_group = False
 
                # New named group
@@ -439,11 +455,17 @@ class client():
             if new_group:
                opc_group.IsSubscribed = 1
                opc_group.IsActive = 1
+
                if not sync:
                   if self.trace: self.trace('WithEvents(%s)' % opc_group.Name)
+                  if update >= 0:
+                     opc_group.UpdateRate = update
                   global current_client
                   current_client = self
+                  global current_sub_group
+                  current_sub_group = sub_group
                   self._group_hooks[opc_group.Name] = win32com.client.WithEvents(opc_group, GroupEvents)
+                  if self.trace: self.trace('   WithEvents returned: ' + str(self._group_hooks[opc_group.Name]))
 
                tags = tag_groups[gid]
                
@@ -490,8 +512,8 @@ class client():
                values = []
                errors = []
                qualities = []
-               timestamps= []
-               
+               timestamps = []
+
                if len(valid_tags) > 0:
                    server_handles.insert(0,0)
                    
@@ -512,83 +534,99 @@ class client():
                       tag_time[tag] = timestamps[i]
                       tag_error[tag] = errors[i]
 
-            # Async Read
             else:
                if len(valid_tags) > 0:
-                  if self._tx_id >= 0xFFFF:
-                      self._tx_id = 0
-                  self._tx_id += 1
-      
-                  if source != 'hybrid':
-                     data_source = SOURCE_CACHE if source == 'cache' else SOURCE_DEVICE
+                  if (not new_group) and (update > 0):
+                     # Data changes. Rely on OnDataChange callback (only reads changed data rather than full refresh).
+                     if self.trace: self.trace('Checking for changed data')
 
-                  if self.trace: self.trace('AsyncRefresh(%s)' % data_source)
+                     handles = ()
 
-                  try:
-                     opc_group.AsyncRefresh(data_source, self._tx_id)
-                  except pythoncom.com_error, err:
-                     error_msg = 'AsyncRefresh: %s' % self._get_error_str(err)
-                     raise OPCError, error_msg
+                     if self.trace: self.trace('PumpWaitingMessages()')
+                     pythoncom.PumpWaitingMessages()
+                     #pythoncom.PumpMessages()   # blocks thread; continuously pumps messages
 
-                  tx_id = 0
-                  start = time.time() * 1000
-                  
-                  while tx_id != self._tx_id:
-                     now = time.time() * 1000
-                     if now - start > timeout:
-                        raise TimeoutError, 'Callback: Timeout waiting for data'
+                     if not self.callback_queue[sub_group].empty():
+                        tx_id, handles, values, qualities, timestamps = self.callback_queue[sub_group].get()
 
-                     if self.callback_queue.empty():
-                        pythoncom.PumpWaitingMessages()
-                     else:
-                        tx_id, handles, values, qualities, timestamps = self.callback_queue.get()
+                  else:
+                     # Async Read (AsyncRefresh)
+                     if self._tx_id >= 0xFFFF:
+                        self._tx_id = 0
+                     self._tx_id += 1
+
+                     if source != 'hybrid':
+                        data_source = SOURCE_CACHE if source == 'cache' else SOURCE_DEVICE
+
+                     if self.trace: self.trace('AsyncRefresh(%s)' % data_source)
+
+                     try:
+                        opc_group.AsyncRefresh(data_source, self._tx_id)
+                     except pythoncom.com_error, err:
+                        error_msg = 'AsyncRefresh: %s' % self._get_error_str(err)
+                        raise OPCError, error_msg
+
+                     tx_id = 0
+                     start = time.time() * 1000
+                     
+                     while tx_id != self._tx_id:
+                        now = time.time() * 1000
+                        if now - start > timeout:
+                           raise TimeoutError, 'Callback: Timeout waiting for data'
+
+                        if self.callback_queue[sub_group].empty():
+                           pythoncom.PumpWaitingMessages()
+                        else:
+                           tx_id, handles, values, qualities, timestamps = self.callback_queue[sub_group].get()
                                                 
                   for i,h in enumerate(handles):
                      tag = self._group_handles_tag[sub_group][h]
                      tag_value[tag] = values[i]
                      tag_quality[tag] = qualities[i]
                      tag_time[tag] = timestamps[i]
-            
-            for tag in tags:
-               if tag_value.has_key(tag):
-                  if (not sync and len(valid_tags) > 0) or (sync and tag_error[tag] == 0):
-                     value = tag_value[tag]
-                     if type(value) == pywintypes.TimeType:
-                        value = str(value)
-                     quality = quality_str(tag_quality[tag])
-                     try:
-                        timestamp = str(tag_time[tag])
-                     except ValueError:
+ 
+            if tag_value:
+               for tag in tags:
+                  if tag_value.has_key(tag):
+                     if (not sync and len(valid_tags) > 0) or (sync and tag_error[tag] == 0):
+                        value = tag_value[tag]
+                        if type(value) == pywintypes.TimeType:
+                           value = str(value)
+                        quality = quality_str(tag_quality[tag])
+                        try:
+                           timestamp = str(tag_time[tag])
+                        except ValueError:
+                           timestamp = None
+                     else:
+                        value = None
+                        quality = 'Error'
                         timestamp = None
+                     if include_error:
+                        error_msgs[tag] = self._opc.GetErrorString(tag_error[tag]).strip('\r\n')
                   else:
                      value = None
                      quality = 'Error'
                      timestamp = None
-                  if include_error:
-                     error_msgs[tag] = self._opc.GetErrorString(tag_error[tag]).strip('\r\n')
-               else:
-                  value = None
-                  quality = 'Error'
-                  timestamp = None
-                  if include_error and not error_msgs.has_key(tag):
-                     error_msgs[tag] = ''
+                     if include_error and not error_msgs.has_key(tag):
+                        error_msgs[tag] = ''
 
-               if single:
-                  if include_error:
-                     yield (value, quality, timestamp, error_msgs[tag])
+                  if single:
+                     if include_error:
+                        yield (value, quality, timestamp, error_msgs[tag])
+                     else:
+                        yield (value, quality, timestamp)
                   else:
-                     yield (value, quality, timestamp)
-               else:
-                  if include_error:
-                     yield (tag, value, quality, timestamp, error_msgs[tag])
-                  else:
-                     yield (tag, value, quality, timestamp)
+                     if include_error:
+                        yield (tag, value, quality, timestamp, error_msgs[tag])
+                     else:
+                        yield (tag, value, quality, timestamp)
 
             if group == None:
                try:
                   if not sync and self._group_hooks.has_key(opc_group.Name):
                      if self.trace: self.trace('CloseEvents(%s)' % opc_group.Name)
                      self._group_hooks[opc_group.Name].close()
+                     del self.callback_queue[opc_group.Name]
 
                   if self.trace: self.trace('RemoveGroup(%s)' % opc_group.Name)
                   opc_groups.Remove(opc_group.Name)
@@ -867,6 +905,7 @@ class client():
                   if self._group_hooks.has_key(sub_group):
                      if self.trace: self.trace('CloseEvents(%s)' % sub_group)
                      self._group_hooks[sub_group].close()
+                     del self.callback_queue[sub_group]
 
                   try:
                      if self.trace: self.trace('RemoveGroup(%s)' % sub_group)
@@ -996,7 +1035,7 @@ class client():
    def ilist(self, paths='*', recursive=False, flat=False, include_type=False):
       """Iterable version of list()"""
 
-      try:         
+      try:
          try:
             browser = self._opc.CreateBrowser()
          # For OPC servers that don't support browsing
